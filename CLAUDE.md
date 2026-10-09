@@ -135,6 +135,18 @@ Script : `scripts/etape0_verifier_flux_ign.py` ; test navigateur : `scripts/etap
 - **Orthophoto** `ORTHOIMAGERY.ORTHOPHOTOS` (« Photographies aériennes ») : `image/jpeg`, style `normal`, TileMatrixSet annoncé `PM_0_19` (EPSG:3857, niveaux 0 à 19, tuiles 256 px). Le nom générique `PM` répond aussi.
 - **CORS** : `Access-Control-Allow-Origin: *` sur les deux flux ; testé dans Chromium depuis `http://localhost:8000` (lecture des octets du relief et image d'ortho utilisable comme texture).
 - **CesiumJS retenu : 1.145.0** (publié le 01/09/2026 ; la 1.146.0 du 01/10/2026 avait moins de deux semaines).
+- Décisions validées par Yves : noms de TileMatrixSet annoncés (`WGS84G_6_14`, `PM_0_19`) ; relief plat sous le niveau 6 et interpolation du niveau 14 au-delà ; valeurs < −10 m remplacées par 0.
+
+## Résultats de l'étape 1 (vérifiés le 09/10/2026)
+
+Script : `scripts/etape1_communes.py` (prérequis : `pip install -r scripts/requirements.txt`, soit shapely ≥ 2.1).
+
+- EPCI trouvé par son nom : « CC Normandie-Cabourg-Pays d'Auge », SIREN `200065563`. **38 communes** ✔.
+- Source des contours : API Découpage administratif (`geo.api.gouv.fr`), qui sert le jeu Etalab « contours administratifs » 2026, issu d'ADMIN EXPRESS (IGN) et déjà généralisé (un sommet tous les 35 m en médiane ; version « 5 m » d'après cet espacement).
+- **Pas de simplification supplémentaire** : fichier déjà bien sous 1 Mo, et une simplification déplacerait les limites sur l'orthophoto. Option `--tolerance` disponible (simplification qui garde des limites communes identiques entre voisines).
+- `data/communes.geojson` : 261 Ko, champs `insee` et `nom`, 6 décimales, anneaux orientés RFC 7946, couverture sans trou ni chevauchement.
+- `data/epci.geojson` : 51 Ko, un seul polygone sans trou, 279,2 km², **identique** au contour EPCI officiel de l'API (écart 0 m²).
+- Emprise de NCPA : longitude −0,2958 → 0,0664 ; latitude 49,1497 → 49,3214.
 
 ## Pistes V2 (ne pas développer sans demande)
 
