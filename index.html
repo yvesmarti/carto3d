@@ -241,6 +241,9 @@ function coucheWMTS(params, options = {}) {
     tileMatrixSetID: params.tileMatrixSet,
     tilingScheme: new Cesium.WebMercatorTilingScheme(),   // TileMatrixSet « PM » = Web Mercator
     maximumLevel: params.niveauMax,
+    // Imagerie demandée seulement sur l'Europe de l'Ouest : au-delà (régions polaires visibles
+    // à l'horizon), l'IGN n'a pas d'image et répondrait par des erreurs 404.
+    rectangle: Cesium.Rectangle.fromDegrees(-12, 36, 16, 58),
     credit: CREDIT_IGN,
     ...options,
   });
