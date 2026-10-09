@@ -18,6 +18,8 @@ import math
 import os
 import struct
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -40,16 +42,34 @@ METRES_PAR_DEGRE = 2 * math.pi * 6378137 / 360
 
 
 def telecharger(url, origine=None):
-    """Renvoie (statut, en-têtes, contenu). Ajoute un en-tête Origin pour tester le CORS."""
+    """Renvoie (statut, en-têtes, contenu). Ajoute un en-tête Origin pour tester le CORS.
+
+    Les en-têtes sont renvoyés tels quels (lecture insensible à la casse).
+    Le serveur IGN compresse les tuiles de relief (Content-Encoding: deflate) : un navigateur
+    les décompresse tout seul, mais pas Python, d'où la décompression ci-dessous.
+    """
     entetes = {"User-Agent": "carte3d-ncpa-etape0"}
     if origine:
         entetes["Origin"] = origine
     req = urllib.request.Request(url, headers=entetes)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as rep:
-            return rep.status, dict(rep.headers), rep.read()
-    except urllib.error.HTTPError as err:
-        return err.code, dict(err.headers), err.read()
+    for tentative in range(3):  # quelques nouvelles tentatives en cas de coupure réseau
+        try:
+            with urllib.request.urlopen(req, timeout=60) as rep:
+                statut, entetes_rep, contenu = rep.status, rep.headers, rep.read()
+            break
+        except urllib.error.HTTPError as err:
+            statut, entetes_rep, contenu = err.code, err.headers, err.read()
+            break
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            if tentative == 2:
+                raise
+            time.sleep(2 * (tentative + 1))
+    codage = (entetes_rep.get("Content-Encoding") or "").lower()
+    if codage == "deflate":
+        contenu = zlib.decompress(contenu)
+    elif codage == "gzip":
+        contenu = zlib.decompress(contenu, 16 + zlib.MAX_WBITS)
+    return statut, entetes_rep, contenu
 
 
 def texte(elem, chemin):
@@ -115,9 +135,10 @@ def afficher_couche(nom, couches, jeux):
     return c
 
 
-def comparer_wgs84g(jeu):
-    """Compare WGS84G au GeographicTilingScheme de Cesium : niveau n = 2^(n+1) × 2^n tuiles de 180/2^n degrés."""
-    print("\n=== WGS84G vs GeographicTilingScheme de Cesium ===")
+def comparer_wgs84g(nom, jeu):
+    """Compare un TileMatrixSet géographique au GeographicTilingScheme de Cesium :
+    niveau n = 2^(n+1) × 2^n tuiles de 180/2^n degrés."""
+    print(f"\n=== {nom} vs GeographicTilingScheme de Cesium ===")
     print("  SRS :", jeu["crs"])
     ecarts = []
     for ident, m in sorted(jeu["matrices"].items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
@@ -131,7 +152,7 @@ def comparer_wgs84g(jeu):
                 ecarts.append(ident)
         else:
             ok = None
-        if ident in ("0", "1", "2") or not ok or ident.isdigit() and int(ident) % 4 == 0:
+        if len(jeu["matrices"]) <= 12 or ident in ("0", "1", "2") or not ok or int(ident) % 4 == 0:
             print(f"  niveau {ident:>3} : matrice {m['matrice']}, tuile {m['tuile']} px, "
                   f"{largeur_deg:.10f}° par tuile, coin {m['coin']}"
                   + ("" if ok is None else ("  ✔ conforme" if ok else "  ✘ DIFFÉRENT")))
@@ -212,12 +233,15 @@ def main():
     relief = afficher_couche(COUCHE_RELIEF, couches, jeux)
     ortho = afficher_couche(COUCHE_ORTHO, couches, jeux)
 
-    if "WGS84G" in jeux:
-        comparer_wgs84g(jeux["WGS84G"])
+    # On compare le jeu générique WGS84G et celui réellement annoncé par la couche de relief.
+    noms_tms = ["WGS84G"] + ([l["tms"] for l in relief["liens"]] if relief else [])
+    for nom in dict.fromkeys(noms_tms):
+        if nom in jeux:
+            comparer_wgs84g(nom, jeux[nom])
 
     # --- Tuiles de relief au-dessus de NCPA ---
     if relief:
-        lien = next((l for l in relief["liens"] if l["tms"] == "WGS84G"), relief["liens"][0])
+        lien = next((l for l in relief["liens"] if l["tms"].startswith("WGS84G")), relief["liens"][0])
         jeu = jeux[lien["tms"]]
         niveaux = [int(l["TileMatrix"]) for l in lien["limites"]]
         fmt = next((f for f in relief["formats"] if "bil" in f), relief["formats"][0])
@@ -240,7 +264,7 @@ def main():
 
     # --- Tuile d'orthophoto au-dessus de Cabourg (TileMatrixSet PM = Web Mercator) ---
     if ortho:
-        lien = next((l for l in ortho["liens"] if l["tms"] == "PM"), ortho["liens"][0])
+        lien = next((l for l in ortho["liens"] if l["tms"].startswith("PM")), ortho["liens"][0])
         niveau = 15
         n = 2 ** niveau
         col = int((POINT_TEST["lon"] + 180) / 360 * n)

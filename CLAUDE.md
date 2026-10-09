@@ -119,6 +119,23 @@ Après chaque étape : résumé court à Yves (ce qui est fait, ce qui a été v
 - [ ] Mention « © IGN » visible
 - [ ] README complet
 
+## Résultats de l'étape 0 (vérifiés le 09/10/2026)
+
+Script : `scripts/etape0_verifier_flux_ign.py` ; test navigateur : `scripts/etape0_test_cors.html`.
+
+- **Relief** `ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES` (« Modèle Numérique de Terrain issu du RGEALTI ») : format unique `image/x-bil;bits=32`, style `normal`, tuiles 256 × 256, float32 little-endian.
+  - TileMatrixSet annoncé : `WGS84G_6_14` (SRS `IGNF:WGS84G`), **niveaux 6 à 14 seulement**. Le nom générique `WGS84G` répond aussi.
+  - Grille identique au `GeographicTilingScheme` de Cesium (niveau n = 2^(n+1) × 2^n tuiles de 180/2^n degrés, origine −180 / 90) : numéros de niveau, colonne et ligne utilisables tels quels.
+  - Niveau 14 ≈ 3,1 m (E-O) × 4,8 m (N-S) par pixel à la latitude de NCPA.
+  - Réponse compressée (`Content-Encoding: deflate`) : le navigateur décompresse seul.
+  - « Pas de donnée » = −99999 (mer, hors France). Le rééchantillonnage IGN crée des valeurs intermédiaires (−16 m à −99998 m) sur les pixels voisins de la mer : toutes les valeurs < −10 m sont à traiter comme « pas de donnée » → 0.
+  - Valeurs observées : marais de la Dives 0–5 m, valeur fréquente −2,09 m sur l'estran, jusqu'à 112 m vers Dozulé.
+  - Hors des `TileMatrixLimits` : HTTP 404 (« No data found ») → ne pas demander ces tuiles, renvoyer une tuile plate.
+  - Les tuiles voisines **ne partagent pas leur bord** (pixel = surface) : écart au raccord ≈ écart entre deux pixels voisins (0,3 à 0,7 m en moyenne au niveau 13). À traiter à l'étape 2.
+- **Orthophoto** `ORTHOIMAGERY.ORTHOPHOTOS` (« Photographies aériennes ») : `image/jpeg`, style `normal`, TileMatrixSet annoncé `PM_0_19` (EPSG:3857, niveaux 0 à 19, tuiles 256 px). Le nom générique `PM` répond aussi.
+- **CORS** : `Access-Control-Allow-Origin: *` sur les deux flux ; testé dans Chromium depuis `http://localhost:8000` (lecture des octets du relief et image d'ortho utilisable comme texture).
+- **CesiumJS retenu : 1.145.0** (publié le 01/09/2026 ; la 1.146.0 du 01/10/2026 avait moins de deux semaines).
+
 ## Pistes V2 (ne pas développer sans demande)
 
 - MNT LiDAR HD pour un zoom très détaillé.
