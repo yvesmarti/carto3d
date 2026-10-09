@@ -12,7 +12,11 @@
 <script src="https://cdn.jsdelivr.net/npm/cesium@1.145.0/Build/Cesium/Cesium.js"
         integrity="sha384-D1oR8FyBDsJWkPeydGJTh8nJg5/++9sqchzJuu+oGQPmgbwu3aJmoVj3BTowr6t6" crossorigin="anonymous"></script>
 <style>
-  html, body, #carte { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #1d2228; }
+  html, body, #carte { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+  /* Fond visible autour de la zone affichée (le globe n'est dessiné que sur NCPA + 10 km). */
+  body { background: radial-gradient(ellipse at 50% 35%, #f4f1ea 0%, #d9d5cb 70%, #c9c4b8 100%); }
+  .erreur { max-width: 36em; margin: 20vh auto; padding: 1em 1.5em; font: 16px/1.5 system-ui, sans-serif;
+            background: #fff; border-left: 4px solid #b00020; }
 </style>
 </head>
 <body>
@@ -87,20 +91,23 @@ const CREDIT_IGN = new Cesium.Credit("© IGN – Géoplateforme", true);
  * appartiennent en partie aux tuiles voisines, qu'on télécharge aussi : deux tuiles voisines
  * calculent ainsi exactement les mêmes valeurs sur leur bord commun, sans couture.
  */
-function creerReliefIGN() {
+function creerReliefIGN(zone) {
   const N = RELIEF.taille + 1;           // 257 points par côté
   const TAILLE_CACHE = 200;              // tuiles IGN décodées gardées en mémoire (~50 Mo)
   const MAX_TELECHARGEMENTS = 16;        // requêtes simultanées vers l'IGN
   const MAX_CONSTRUCTIONS = 8;           // tuiles Cesium préparées en parallèle
 
+  const decoupage = new Cesium.GeographicTilingScheme();
   const cache = new Map();               // "niveau/x/y" → Promise<Float32Array | null>
   let telechargementsEnCours = 0;
   const fileAttente = [];
   let constructionsEnCours = 0;
 
+  // Tuile proposée par l'IGN (TileMatrixLimits) et touchant la zone d'affichage.
   const disponible = (x, y, z) => {
     const l = RELIEF.limites[z];
-    return l !== undefined && y >= l[0] && y <= l[1] && x >= l[2] && x <= l[3];
+    return l !== undefined && y >= l[0] && y <= l[1] && x >= l[2] && x <= l[3] &&
+      zone.touche(decoupage.tileXYToRectangle(x, y, z));
   };
 
   // Petit régulateur : au plus MAX_TELECHARGEMENTS requêtes en même temps.
@@ -201,10 +208,10 @@ function creerReliefIGN() {
   const fournisseur = new Cesium.CustomHeightmapTerrainProvider({
     width: N,
     height: N,
-    tilingScheme: new Cesium.GeographicTilingScheme(),
+    tilingScheme: decoupage,
     credit: CREDIT_IGN,
     callback(x, y, niveau) {
-      // Sous le niveau 6 (vue de très haut) ou hors de la zone couverte : sol plat au niveau de la mer.
+      // Sous le niveau 6 (vue de très haut) ou hors zone : sol plat au niveau de la mer, sans requête.
       if (niveau < RELIEF.niveauMin || !disponible(x, y, niveau)) return grillePlate();
       // Trop de tuiles en préparation : « undefined » demande à Cesium de réessayer plus tard.
       if (constructionsEnCours >= MAX_CONSTRUCTIONS) return undefined;
@@ -232,7 +239,7 @@ function urlWMTS({ couche, style, tileMatrixSet, format }, niveau = "{TileMatrix
     `&FORMAT=${format}`;
 }
 
-function coucheWMTS(params, options = {}) {
+function coucheWMTS(params, zone) {
   const fournisseur = new Cesium.WebMapTileServiceImageryProvider({
     url: urlWMTS(params),
     layer: params.couche,
@@ -241,12 +248,14 @@ function coucheWMTS(params, options = {}) {
     tileMatrixSetID: params.tileMatrixSet,
     tilingScheme: new Cesium.WebMercatorTilingScheme(),   // TileMatrixSet « PM » = Web Mercator
     maximumLevel: params.niveauMax,
-    // Imagerie demandée seulement sur l'Europe de l'Ouest : au-delà (régions polaires visibles
-    // à l'horizon), l'IGN n'a pas d'image et répondrait par des erreurs 404.
-    rectangle: Cesium.Rectangle.fromDegrees(-12, 36, 16, 58),
+    rectangle: zone.rectangle,                            // aucune requête hors du rectangle de la zone
     credit: CREDIT_IGN,
-    ...options,
   });
+  // Dans les coins du rectangle situés hors zone : image vide, sans requête vers l'IGN.
+  const demanderImage = fournisseur.requestImage.bind(fournisseur);
+  fournisseur.requestImage = (x, y, niveau, requete) =>
+    zone.touche(fournisseur.tilingScheme.tileXYToRectangle(x, y, niveau))
+      ? demanderImage(x, y, niveau, requete) : Promise.resolve(IMAGE_VIDE);
   // Au large, l'IGN n'a plus d'image aux zooms élevés (erreur 404 « pas de donnée ») : Cesium
   // affiche alors la tuile de niveau inférieur. Ces erreurs attendues ne sont pas signalées.
   let signalees = 0;
@@ -257,57 +266,123 @@ function coucheWMTS(params, options = {}) {
   return fournisseur;
 }
 
-// Près des côtes, l'IGN remplit la mer de tuiles toutes blanches (zooms 13 à 16), toutes
-// identiques à l'octet près. Cesium les reconnaît grâce à cette tuile de référence, les écarte
-// et affiche à la place la tuile de niveau inférieur (mer bleue).
-function politiqueTuilesBlanches() {
-  return new Cesium.DiscardMissingTileImagePolicy({
-    missingImageUrl: urlWMTS({ ...ORTHO, style: "normal", format: "image/jpeg" }, 13, 2801, 4093),
-    pixelsToCheck: [[0, 0], [255, 0], [0, 255], [255, 255], [128, 128], [64, 192], [192, 64]]
-      .map(([x, y]) => new Cesium.Cartesian2(x, y)),
-  });
+const IMAGE_VIDE = document.createElement("canvas");   // 1 × 1 pixel transparent
+IMAGE_VIDE.width = IMAGE_VIDE.height = 1;
+
+// ============================================================================
+// Zone d'affichage : NCPA + 10 km (data/zone.geojson, produit par scripts/zone_affichage.py)
+// ============================================================================
+
+function creerZone(geojson) {
+  const anneau = geojson.features[0].geometry.coordinates[0].slice(0, -1);   // [lon, lat] en degrés
+  const lons = anneau.map((p) => p[0]), lats = anneau.map((p) => p[1]);
+  const emprise = { ouest: Math.min(...lons), sud: Math.min(...lats), est: Math.max(...lons), nord: Math.max(...lats) };
+
+  // Point dans le polygone (méthode du rayon).
+  const contient = (lon, lat) => {
+    let dedans = false;
+    for (let i = 0, j = anneau.length - 1; i < anneau.length; j = i++) {
+      const [xi, yi] = anneau[i], [xj, yj] = anneau[j];
+      if ((yi > lat) !== (yj > lat) && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) dedans = !dedans;
+    }
+    return dedans;
+  };
+  // Les segments [a, b] et [c, d] se coupent-ils ?
+  const orientation = (a, b, c) => Math.sign((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+  const secants = (a, b, c, d) =>
+    orientation(a, b, c) !== orientation(a, b, d) && orientation(c, d, a) !== orientation(c, d, b);
+
+  // Le rectangle d'une tuile (en radians) touche-t-il la zone ?
+  function touche(r) {
+    const o = Cesium.Math.toDegrees(r.west), e = Cesium.Math.toDegrees(r.east);
+    const s = Cesium.Math.toDegrees(r.south), n = Cesium.Math.toDegrees(r.north);
+    if (e < emprise.ouest || o > emprise.est || n < emprise.sud || s > emprise.nord) return false;
+    if (contient((o + e) / 2, (s + n) / 2)) return true;                       // tuile dans la zone
+    if (anneau.some(([x, y]) => x >= o && x <= e && y >= s && y <= n)) return true;   // zone dans la tuile
+    const coins = [[o, s], [e, s], [e, n], [o, n]];
+    return anneau.some((a, i) => {                                             // contours qui se croisent
+      const b = anneau[(i + 1) % anneau.length];
+      return coins.some((c, k) => secants(a, b, c, coins[(k + 1) % 4]));
+    });
+  }
+
+  return {
+    anneau,
+    rectangle: Cesium.Rectangle.fromDegrees(emprise.ouest, emprise.sud, emprise.est, emprise.nord),
+    touche,
+  };
 }
 
 // ============================================================================
 // Visionneuse
 // ============================================================================
 
-const viewer = new Cesium.Viewer("carte", {
-  // Aucun service Cesium Ion ni couche par défaut : pas de clé API.
-  baseLayer: false,
-  baseLayerPicker: false,
-  geocoder: false,
-  homeButton: false,
-  sceneModePicker: false,
-  navigationHelpButton: false,
-  animation: false,
-  timeline: false,
-  fullscreenButton: false,
-  infoBox: false,
-  selectionIndicator: false,
-  terrainProvider: creerReliefIGN(),
-  // L'image n'est recalculée que si quelque chose change (économise le processeur graphique).
-  requestRenderMode: true,
-  maximumRenderTimeChange: Infinity,
-});
+let viewer;
 
-const scene = viewer.scene;
-const globe = scene.globe;
-globe.baseColor = Cesium.Color.fromCssColorString("#cfc8b8");   // visible le temps du chargement
+async function demarrer() {
+  const zone = creerZone(await (await fetch("data/zone.geojson")).json());
 
-viewer.imageryLayers.addImageryProvider(coucheWMTS(
-  { ...ORTHO, style: "normal", format: "image/jpeg" },
-  { tileDiscardPolicy: politiqueTuilesBlanches() }));
-if (ESTOMPAGE) {
-  // Ombre noire semi-transparente (au plus 20 % d'opacité), calculée par l'IGN.
-  viewer.imageryLayers.addImageryProvider(coucheWMTS({
-    couche: "ELEVATION.ELEVATIONGRIDCOVERAGE.SHADOW", style: "estompage_grayscale",
-    tileMatrixSet: "PM_0_15", format: "image/png", niveauMax: 15,
+  viewer = new Cesium.Viewer("carte", {
+    // Aucun service Cesium Ion ni couche par défaut : pas de clé API.
+    baseLayer: false,
+    baseLayerPicker: false,
+    geocoder: false,
+    homeButton: false,
+    sceneModePicker: false,
+    navigationHelpButton: false,
+    animation: false,
+    timeline: false,
+    fullscreenButton: false,
+    infoBox: false,
+    selectionIndicator: false,
+    skyBox: false,
+    skyAtmosphere: false,
+    terrainProvider: creerReliefIGN(zone),
+    // L'image n'est recalculée que si quelque chose change (économise le processeur graphique).
+    requestRenderMode: true,
+    maximumRenderTimeChange: Infinity,
+    // Fond transparent : le dégradé CSS de la page apparaît autour de la zone affichée.
+    contextOptions: { webgl: { alpha: true } },
+  });
+
+  const scene = viewer.scene;
+  const globe = scene.globe;
+  scene.backgroundColor = Cesium.Color.TRANSPARENT;
+  scene.sun.show = false;
+  scene.moon.show = false;
+  globe.baseColor = Cesium.Color.fromCssColorString("#cfc8b8");   // visible le temps du chargement
+
+  // Seule la zone NCPA + 10 km est affichée : le rectangle limite évite tout chargement
+  // au-delà, le polygone découpe l'affichage selon le contour exact de la zone.
+  globe.cartographicLimitRectangle = zone.rectangle;
+  globe.clippingPolygons = new Cesium.ClippingPolygonCollection({
+    polygons: [new Cesium.ClippingPolygon({ positions: Cesium.Cartesian3.fromDegreesArray(zone.anneau.flat()) })],
+    inverse: true,                  // on garde l'intérieur du polygone, on masque l'extérieur
+  });
+
+  // Orthophoto en deux couches. Au large, à partir du zoom 13, l'IGN complète l'image par du
+  // blanc pur (tuiles entièrement ou à moitié blanches). Dans la couche détaillée, ces pixels
+  // blancs sont rendus transparents : on voit à leur place la couche de fond, limitée au
+  // zoom 12, où la mer est partout photographiée.
+  const ortho = { ...ORTHO, style: "normal", format: "image/jpeg" };
+  viewer.imageryLayers.addImageryProvider(coucheWMTS({ ...ortho, niveauMax: 12 }, zone));
+  viewer.imageryLayers.add(new Cesium.ImageryLayer(coucheWMTS(ortho, zone), {
+    colorToAlpha: Cesium.Color.WHITE,
+    colorToAlphaThreshold: 0.02,      // tolère le léger « bruit » de compression JPEG
   }));
+  if (ESTOMPAGE) {
+    // Ombre noire semi-transparente (au plus 20 % d'opacité), calculée par l'IGN.
+    viewer.imageryLayers.addImageryProvider(coucheWMTS({
+      couche: "ELEVATION.ELEVATIONGRIDCOVERAGE.SHADOW", style: "estompage_grayscale",
+      tileMatrixSet: "PM_0_15", format: "image/png", niveauMax: 15,
+    }, zone));
+  }
+  // Exagération du relief, calculée à partir du niveau de la mer (et non de l'ellipsoïde).
+  scene.verticalExaggeration = EXAGERATION_DEFAUT;
+  scene.verticalExaggerationRelativeHeight = ONDULATION_GEOIDE;
+
+  vueNCPA();
 }
-// Exagération du relief, calculée à partir du niveau de la mer (et non de l'ellipsoïde).
-scene.verticalExaggeration = EXAGERATION_DEFAUT;
-scene.verticalExaggerationRelativeHeight = ONDULATION_GEOIDE;
 
 // Vue générale inclinée de NCPA, regard vers le nord (la mer en arrière-plan).
 function vueNCPA(duree = 0) {
@@ -318,7 +393,14 @@ function vueNCPA(duree = 0) {
     duration: duree,
   });
 }
-vueNCPA();
+
+demarrer().catch((erreur) => {
+  console.error(erreur);
+  document.getElementById("carte").innerHTML =
+    "<p class='erreur'>La carte n'a pas pu démarrer. Elle doit être ouverte via un serveur web " +
+    "(par exemple <code>python -m http.server</code>, voir le README), et non par un double-clic " +
+    "sur le fichier.</p>";
+});
 </script>
 </body>
 </html>

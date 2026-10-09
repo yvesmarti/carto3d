@@ -28,6 +28,7 @@ Application web 3D, hébergée en fichiers statiques (aucun serveur applicatif),
 - Relief : flux WMTS IGN `ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES` (RGE ALTI) sur `https://data.geopf.fr/wmts`, lu par un `CustomHeightmapTerrainProvider` (module de « traduction » tuiles IGN → Cesium).
 - Orthophoto : flux WMTS IGN `ORTHOIMAGERY.ORTHOPHOTOS` sur `https://data.geopf.fr/wmts` (TileMatrixSet `PM`, JPEG) via `WebMapTileServiceImageryProvider`.
 - Plan B (seulement si le relief IGN s'avère inexploitable après investigation) : Cesium World Terrain avec un jeton Ion. En parler à Yves avant de basculer.
+- **Zone d'affichage limitée à NCPA + 10 km au maximum** (demande de Yves, 09/10/2026) : rien n'est chargé ni affiché au-delà. Zone tampon calculée en Lambert-93 par `scripts/zone_affichage.py` → `data/zone.geojson` ; dans `index.html`, `globe.cartographicLimitRectangle` (aucune tuile chargée hors du rectangle englobant) + `globe.clippingPolygons` (affichage découpé selon le contour exact) + filtre des requêtes relief et ortho sur le polygone.
 
 ## Contexte vérifié sur les sources (octobre 2026)
 

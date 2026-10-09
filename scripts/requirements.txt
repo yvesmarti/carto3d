@@ -1,1 +1,2 @@
 shapely>=2.1
+pyproj>=3.6
