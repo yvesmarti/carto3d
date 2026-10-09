@@ -57,6 +57,19 @@ const RELIEF = {
 // Raccord entre tuiles voisines (voir creerReliefIGN).
 const RACCORD_VOISINES = true;
 
+// Orthophotographie IGN (GetCapabilities du 09/10/2026) : JPEG, Web Mercator, niveaux 0 à 19.
+const ORTHO = {
+  couche: "ORTHOIMAGERY.ORTHOPHOTOS",
+  tileMatrixSet: "PM_0_19",
+  niveauMax: 19,
+};
+
+// Estompage IGN (ombrage du relief) superposé à l'orthophoto : à l'essai.
+const ESTOMPAGE = false;
+
+// Mention de la source, affichée en permanence (Licence Ouverte Etalab 2.0).
+const CREDIT_IGN = new Cesium.Credit("© IGN – Géoplateforme", true);
+
 // ============================================================================
 // Relief IGN → Cesium
 // ============================================================================
@@ -189,7 +202,7 @@ function creerReliefIGN() {
     width: N,
     height: N,
     tilingScheme: new Cesium.GeographicTilingScheme(),
-    credit: new Cesium.Credit("© IGN – Géoplateforme", true),   // true = affiché en permanence
+    credit: CREDIT_IGN,
     callback(x, y, niveau) {
       // Sous le niveau 6 (vue de très haut) ou hors de la zone couverte : sol plat au niveau de la mer.
       if (niveau < RELIEF.niveauMin || !disponible(x, y, niveau)) return grillePlate();
@@ -207,49 +220,48 @@ function creerReliefIGN() {
 }
 
 // ============================================================================
-// Visualisation provisoire du relief (étape 2) : teinte selon l'altitude + courbes de niveau
+// Imagerie IGN drapée sur le relief
 // ============================================================================
 
-function materiauHypsometrique(exageration) {
-  // Rampe de couleurs : marais (vert) → coteaux (ocre) → sommets (brun clair).
-  const rampe = document.createElement("canvas");
-  rampe.width = 256;
-  rampe.height = 1;
-  const ctx = rampe.getContext("2d");
-  const degrade = ctx.createLinearGradient(0, 0, 256, 0);
-  [[0, "#4d7f5a"], [0.08, "#8fb07a"], [0.3, "#d9cf94"], [0.6, "#c49a5f"], [1, "#f1e7d8"]]
-    .forEach(([position, couleur]) => degrade.addColorStop(position, couleur));
-  ctx.fillStyle = degrade;
-  ctx.fillRect(0, 0, 256, 1);
+// Adresse d'une tuile WMTS de la Géoplateforme. Cesium remplace {TileMatrix}, {TileRow}
+// et {TileCol} par le niveau, la ligne et la colonne de chaque tuile.
+function urlWMTS({ couche, style, tileMatrixSet, format }, niveau = "{TileMatrix}",
+                 ligne = "{TileRow}", colonne = "{TileCol}") {
+  return `${IGN_WMTS}?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=${couche}&STYLE=${style}` +
+    `&TILEMATRIXSET=${tileMatrixSet}&TILEMATRIX=${niveau}&TILEROW=${ligne}&TILECOL=${colonne}` +
+    `&FORMAT=${format}`;
+}
 
-  return new Cesium.Material({
-    translucent: false,
-    fabric: {
-      type: "ReliefHypsometrique",
-      uniforms: {
-        rampe,
-        altitudeMax: 160.0,
-        equidistance: 10.0,
-        niveauMer: ONDULATION_GEOIDE,
-        exageration,
-      },
-      // materialInput.height = hauteur affichée (exagérée) ; on revient à l'altitude IGN69 réelle.
-      source: `
-        czm_material czm_getMaterial(czm_materialInput materialInput) {
-          czm_material m = czm_getDefaultMaterial(materialInput);
-          float altitude = (materialInput.height - niveauMer) / exageration;
-          vec3 couleur = texture(rampe, vec2(clamp(altitude / altitudeMax, 0.0, 1.0), 0.5)).rgb;
-          float ecart = abs(fract(altitude / equidistance + 0.5) - 0.5) * equidistance;
-          float trait = 1.0 - smoothstep(0.0, 1.2 * fwidth(altitude) + 1e-4, ecart);
-          if (altitude < 0.5) {            // mer et zones sans donnée : gris-bleu, sans courbe
-            couleur = vec3(0.62, 0.69, 0.72);
-            trait = 0.0;
-          }
-          m.diffuse = mix(couleur, vec3(0.25, 0.2, 0.15), 0.6 * trait);
-          m.alpha = 1.0;
-          return m;
-        }`,
-    },
+function coucheWMTS(params, options = {}) {
+  const fournisseur = new Cesium.WebMapTileServiceImageryProvider({
+    url: urlWMTS(params),
+    layer: params.couche,
+    style: params.style,
+    format: params.format,
+    tileMatrixSetID: params.tileMatrixSet,
+    tilingScheme: new Cesium.WebMercatorTilingScheme(),   // TileMatrixSet « PM » = Web Mercator
+    maximumLevel: params.niveauMax,
+    credit: CREDIT_IGN,
+    ...options,
+  });
+  // Au large, l'IGN n'a plus d'image aux zooms élevés (erreur 404 « pas de donnée ») : Cesium
+  // affiche alors la tuile de niveau inférieur. Ces erreurs attendues ne sont pas signalées.
+  let signalees = 0;
+  fournisseur.errorEvent.addEventListener((erreur) => {
+    if (erreur.error?.statusCode === 404) return;
+    if (signalees++ < 5) console.warn(`${params.couche} : ${erreur.message}`);
+  });
+  return fournisseur;
+}
+
+// Près des côtes, l'IGN remplit la mer de tuiles toutes blanches (zooms 13 à 16), toutes
+// identiques à l'octet près. Cesium les reconnaît grâce à cette tuile de référence, les écarte
+// et affiche à la place la tuile de niveau inférieur (mer bleue).
+function politiqueTuilesBlanches() {
+  return new Cesium.DiscardMissingTileImagePolicy({
+    missingImageUrl: urlWMTS({ ...ORTHO, style: "normal", format: "image/jpeg" }, 13, 2801, 4093),
+    pixelsToCheck: [[0, 0], [255, 0], [0, 255], [255, 255], [128, 128], [64, 192], [192, 64]]
+      .map(([x, y]) => new Cesium.Cartesian2(x, y)),
   });
 }
 
@@ -278,8 +290,18 @@ const viewer = new Cesium.Viewer("carte", {
 
 const scene = viewer.scene;
 const globe = scene.globe;
-globe.baseColor = Cesium.Color.fromCssColorString("#cfc8b8");
-globe.material = materiauHypsometrique(EXAGERATION_DEFAUT);
+globe.baseColor = Cesium.Color.fromCssColorString("#cfc8b8");   // visible le temps du chargement
+
+viewer.imageryLayers.addImageryProvider(coucheWMTS(
+  { ...ORTHO, style: "normal", format: "image/jpeg" },
+  { tileDiscardPolicy: politiqueTuilesBlanches() }));
+if (ESTOMPAGE) {
+  // Ombre noire semi-transparente (au plus 20 % d'opacité), calculée par l'IGN.
+  viewer.imageryLayers.addImageryProvider(coucheWMTS({
+    couche: "ELEVATION.ELEVATIONGRIDCOVERAGE.SHADOW", style: "estompage_grayscale",
+    tileMatrixSet: "PM_0_15", format: "image/png", niveauMax: 15,
+  }));
+}
 // Exagération du relief, calculée à partir du niveau de la mer (et non de l'ellipsoïde).
 scene.verticalExaggeration = EXAGERATION_DEFAUT;
 scene.verticalExaggerationRelativeHeight = ONDULATION_GEOIDE;
