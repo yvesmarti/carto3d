@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carte 3D de NCPA</title>
+<link rel="icon" href="data:,">
+<!-- CesiumJS, version épinglée (1.145.0, publiée le 01/09/2026), servie par jsDelivr.
+     L'attribut « integrity » garantit que le fichier reçu est exactement celui attendu. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cesium@1.145.0/Build/Cesium/Widgets/widgets.css"
+      integrity="sha384-ghEeMdcWWzRv/BPeUcX835vcKDGrxvROXisl/Btpv3GeekBUXTSPVcFJpI1Tcrgp" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.145.0/Build/Cesium/Cesium.js"
+        integrity="sha384-D1oR8FyBDsJWkPeydGJTh8nJg5/++9sqchzJuu+oGQPmgbwu3aJmoVj3BTowr6t6" crossorigin="anonymous"></script>
+<style>
+  html, body, #carte { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #1d2228; }
+</style>
+</head>
+<body>
+<div id="carte"></div>
+<script>
+"use strict";
+
+// ============================================================================
+// Paramètres
+// ============================================================================
+
+const IGN_WMTS = "https://data.geopf.fr/wmts";
+
+// Les altitudes IGN (RGE ALTI) sont exprimées dans le système NGF-IGN69 (niveau moyen de la mer).
+// Cesium attend des hauteurs au-dessus de l'ellipsoïde : il faut ajouter l'écart entre les deux,
+// appelé « ondulation du géoïde ». Calculé avec la grille officielle IGN RAF20 : de 45,5 m
+// (Saint-Vaast-en-Auge) à 46,0 m (Ranville) sur NCPA. Une constante suffit (erreur < 0,3 m).
+const ONDULATION_GEOIDE = 45.7;
+
+const EXAGERATION_DEFAUT = 2;
+
+// Emprise de NCPA (degrés), issue de data/epci.geojson.
+const EMPRISE_NCPA = { ouest: -0.2958, sud: 49.1497, est: 0.0664, nord: 49.3214 };
+
+// Couche de relief IGN, telle que décrite par le GetCapabilities du 09/10/2026.
+const RELIEF = {
+  couche: "ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES",
+  tileMatrixSet: "WGS84G_6_14",
+  niveauMin: 6,
+  niveauMax: 14,
+  taille: 256,               // pixels par côté de tuile
+  seuilPasDeDonnee: -10,     // en dessous : mer, hors France ou artefact de bord de mer → 0 m
+  // TileMatrixLimits par niveau : [ligne min, ligne max, colonne min, colonne max].
+  // Hors de ces limites, le serveur répond « 404 No data found » : on ne demande pas ces tuiles.
+  limites: {
+    6: [13, 40, 41, 84],         7: [27, 81, 83, 169],          8: [55, 162, 166, 338],
+    9: [110, 324, 332, 676],     10: [221, 648, 665, 1353],     11: [442, 1297, 1331, 2707],
+    12: [885, 2594, 2663, 5415], 13: [1770, 5188, 5326, 10831], 14: [3540, 10376, 10653, 21663],
+  },
+};
+
+// Raccord entre tuiles voisines (voir creerReliefIGN).
+const RACCORD_VOISINES = true;
+
+// ============================================================================
+// Relief IGN → Cesium
+// ============================================================================
+
+/*
+ * Traduit les tuiles de relief IGN en tuiles de relief Cesium.
+ *
+ * Le découpage IGN « WGS84G » est identique à celui de Cesium (GeographicTilingScheme) :
+ * la tuile Cesium (x, y, niveau) correspond à la tuile IGN (colonne x, ligne y, même niveau).
+ *
+ * Particularité : chaque valeur IGN représente un petit carré (pixel), alors que Cesium attend
+ * des points posés sur une grille dont la première et la dernière ligne tombent exactement sur
+ * le bord de la tuile. On fabrique donc une grille de 257 × 257 points placés aux coins des
+ * pixels : chaque point vaut la moyenne des 4 pixels qui l'entourent. Sur les bords, ces pixels
+ * appartiennent en partie aux tuiles voisines, qu'on télécharge aussi : deux tuiles voisines
+ * calculent ainsi exactement les mêmes valeurs sur leur bord commun, sans couture.
+ */
+function creerReliefIGN() {
+  const N = RELIEF.taille + 1;           // 257 points par côté
+  const TAILLE_CACHE = 200;              // tuiles IGN décodées gardées en mémoire (~50 Mo)
+  const MAX_TELECHARGEMENTS = 16;        // requêtes simultanées vers l'IGN
+  const MAX_CONSTRUCTIONS = 8;           // tuiles Cesium préparées en parallèle
+
+  const cache = new Map();               // "niveau/x/y" → Promise<Float32Array | null>
+  let telechargementsEnCours = 0;
+  const fileAttente = [];
+  let constructionsEnCours = 0;
+
+  const disponible = (x, y, z) => {
+    const l = RELIEF.limites[z];
+    return l !== undefined && y >= l[0] && y <= l[1] && x >= l[2] && x <= l[3];
+  };
+
+  // Petit régulateur : au plus MAX_TELECHARGEMENTS requêtes en même temps.
+  async function avecJeton(tache) {
+    if (telechargementsEnCours >= MAX_TELECHARGEMENTS) {
+      await new Promise((reprendre) => fileAttente.push(reprendre));
+    }
+    telechargementsEnCours++;
+    try {
+      return await tache();
+    } finally {
+      telechargementsEnCours--;
+      const suivant = fileAttente.shift();
+      if (suivant) suivant();
+    }
+  }
+
+  async function telecharger(x, y, z) {
+    const url = `${IGN_WMTS}?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=${RELIEF.couche}` +
+      `&STYLE=normal&TILEMATRIXSET=${RELIEF.tileMatrixSet}&TILEMATRIX=${z}&TILEROW=${y}&TILECOL=${x}` +
+      `&FORMAT=image/x-bil;bits=32`;
+    const reponse = await avecJeton(() => fetch(url));
+    if (reponse.status === 404) return null;                 // aucune donnée sur cette tuile
+    if (!reponse.ok) throw new Error(`relief IGN : HTTP ${reponse.status} (${url})`);
+    // Le serveur compresse la tuile (deflate) ; le navigateur la décompresse tout seul.
+    // Float32Array lit les octets dans l'ordre « little-endian » des ordinateurs actuels,
+    // qui est aussi celui des tuiles IGN.
+    const valeurs = new Float32Array(await reponse.arrayBuffer());
+    if (valeurs.length !== RELIEF.taille * RELIEF.taille) {
+      throw new Error(`relief IGN : tuile de taille inattendue (${url})`);
+    }
+    for (let i = 0; i < valeurs.length; i++) {
+      // « Pas de donnée » (−99999) et artefacts de bord de mer → 0 m. (NaN échoue aussi au test.)
+      if (!(valeurs[i] >= RELIEF.seuilPasDeDonnee)) valeurs[i] = 0;
+    }
+    return valeurs;
+  }
+
+  // Tuile IGN décodée, depuis le cache si possible. null = pas de donnée (mer, hors zone).
+  function tuileIGN(x, y, z) {
+    const cle = `${z}/${x}/${y}`;
+    let promesse = cache.get(cle);
+    if (promesse) {
+      cache.delete(cle);                 // remise en fin de file : « récemment utilisée »
+    } else {
+      promesse = disponible(x, y, z) ? telecharger(x, y, z) : Promise.resolve(null);
+      // Une erreur réseau ne reste pas en cache (la tuile sera redemandée plus tard).
+      promesse.catch(() => { if (cache.get(cle) === promesse) cache.delete(cle); });
+    }
+    cache.set(cle, promesse);
+    if (cache.size > TAILLE_CACHE) cache.delete(cache.keys().next().value);
+    return promesse;
+  }
+
+  const grillePlate = () => new Float32Array(N * N).fill(ONDULATION_GEOIDE);
+
+  async function construireGrille(x, y, z) {
+    const T = RELIEF.taille;
+    // La tuile centrale et ses 8 voisines, demandées en même temps
+    // (une voisine en erreur est simplement ignorée).
+    const decalages = RACCORD_VOISINES
+      ? [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]] : [];
+    const promessesVoisines = decalages.map(([dy, dx]) => tuileIGN(x + dx, y + dy, z).catch(() => null));
+    const centre = await tuileIGN(x, y, z);
+    if (!centre) return grillePlate();
+    const voisines = new Map();
+    (await Promise.all(promessesVoisines)).forEach((t, i) => voisines.set(decalages[i].join(","), t));
+
+    // Altitude du pixel (ligne, colonne) ; -1 et 256 débordent sur les tuiles voisines.
+    // Sans voisine disponible, on reprend le pixel de bord de la tuile centrale.
+    const borne = (v) => Math.min(Math.max(v, 0), T - 1);
+    const pixel = (ligne, colonne) => {
+      const dy = ligne < 0 ? -1 : ligne >= T ? 1 : 0;
+      const dx = colonne < 0 ? -1 : colonne >= T ? 1 : 0;
+      const voisine = dy || dx ? voisines.get(`${dy},${dx}`) : null;
+      if (voisine) return voisine[(ligne - dy * T) * T + (colonne - dx * T)];
+      return centre[borne(ligne) * T + borne(colonne)];
+    };
+
+    // Bloc étendu : la tuile entourée d'une bordure d'un pixel prise sur les voisines.
+    const E = T + 2;
+    const etendu = new Float32Array(E * E);
+    for (let r = -1; r <= T; r++) {
+      for (let c = -1; c <= T; c++) etendu[(r + 1) * E + (c + 1)] = pixel(r, c);
+    }
+    // Point (i, j) de la grille Cesium = coin commun aux pixels (i-1, j-1), (i-1, j), (i, j-1), (i, j).
+    const grille = new Float32Array(N * N);   // ligne 0 = bord nord, comme les tuiles IGN
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < N; j++) {
+        const k = i * E + j;
+        grille[i * N + j] = ONDULATION_GEOIDE +
+          0.25 * (etendu[k] + etendu[k + 1] + etendu[k + E] + etendu[k + E + 1]);
+      }
+    }
+    return grille;
+  }
+
+  const fournisseur = new Cesium.CustomHeightmapTerrainProvider({
+    width: N,
+    height: N,
+    tilingScheme: new Cesium.GeographicTilingScheme(),
+    credit: new Cesium.Credit("© IGN – Géoplateforme", true),   // true = affiché en permanence
+    callback(x, y, niveau) {
+      // Sous le niveau 6 (vue de très haut) ou hors de la zone couverte : sol plat au niveau de la mer.
+      if (niveau < RELIEF.niveauMin || !disponible(x, y, niveau)) return grillePlate();
+      // Trop de tuiles en préparation : « undefined » demande à Cesium de réessayer plus tard.
+      if (constructionsEnCours >= MAX_CONSTRUCTIONS) return undefined;
+      constructionsEnCours++;
+      return construireGrille(x, y, niveau).finally(() => constructionsEnCours--);
+    },
+  });
+
+  // Au-delà du niveau 14, l'IGN n'a plus de tuiles : on le signale à Cesium, qui affine alors
+  // lui-même le maillage à partir du niveau 14 (interpolation).
+  fournisseur.getTileDataAvailable = (x, y, niveau) => niveau <= RELIEF.niveauMax;
+  return fournisseur;
+}
+
+// ============================================================================
+// Visualisation provisoire du relief (étape 2) : teinte selon l'altitude + courbes de niveau
+// ============================================================================
+
+function materiauHypsometrique(exageration) {
+  // Rampe de couleurs : marais (vert) → coteaux (ocre) → sommets (brun clair).
+  const rampe = document.createElement("canvas");
+  rampe.width = 256;
+  rampe.height = 1;
+  const ctx = rampe.getContext("2d");
+  const degrade = ctx.createLinearGradient(0, 0, 256, 0);
+  [[0, "#4d7f5a"], [0.08, "#8fb07a"], [0.3, "#d9cf94"], [0.6, "#c49a5f"], [1, "#f1e7d8"]]
+    .forEach(([position, couleur]) => degrade.addColorStop(position, couleur));
+  ctx.fillStyle = degrade;
+  ctx.fillRect(0, 0, 256, 1);
+
+  return new Cesium.Material({
+    translucent: false,
+    fabric: {
+      type: "ReliefHypsometrique",
+      uniforms: {
+        rampe,
+        altitudeMax: 160.0,
+        equidistance: 10.0,
+        niveauMer: ONDULATION_GEOIDE,
+        exageration,
+      },
+      // materialInput.height = hauteur affichée (exagérée) ; on revient à l'altitude IGN69 réelle.
+      source: `
+        czm_material czm_getMaterial(czm_materialInput materialInput) {
+          czm_material m = czm_getDefaultMaterial(materialInput);
+          float altitude = (materialInput.height - niveauMer) / exageration;
+          vec3 couleur = texture(rampe, vec2(clamp(altitude / altitudeMax, 0.0, 1.0), 0.5)).rgb;
+          float ecart = abs(fract(altitude / equidistance + 0.5) - 0.5) * equidistance;
+          float trait = 1.0 - smoothstep(0.0, 1.2 * fwidth(altitude) + 1e-4, ecart);
+          if (altitude < 0.5) {            // mer et zones sans donnée : gris-bleu, sans courbe
+            couleur = vec3(0.62, 0.69, 0.72);
+            trait = 0.0;
+          }
+          m.diffuse = mix(couleur, vec3(0.25, 0.2, 0.15), 0.6 * trait);
+          m.alpha = 1.0;
+          return m;
+        }`,
+    },
+  });
+}
+
+// ============================================================================
+// Visionneuse
+// ============================================================================
+
+const viewer = new Cesium.Viewer("carte", {
+  // Aucun service Cesium Ion ni couche par défaut : pas de clé API.
+  baseLayer: false,
+  baseLayerPicker: false,
+  geocoder: false,
+  homeButton: false,
+  sceneModePicker: false,
+  navigationHelpButton: false,
+  animation: false,
+  timeline: false,
+  fullscreenButton: false,
+  infoBox: false,
+  selectionIndicator: false,
+  terrainProvider: creerReliefIGN(),
+  // L'image n'est recalculée que si quelque chose change (économise le processeur graphique).
+  requestRenderMode: true,
+  maximumRenderTimeChange: Infinity,
+});
+
+const scene = viewer.scene;
+const globe = scene.globe;
+globe.baseColor = Cesium.Color.fromCssColorString("#cfc8b8");
+globe.material = materiauHypsometrique(EXAGERATION_DEFAUT);
+// Exagération du relief, calculée à partir du niveau de la mer (et non de l'ellipsoïde).
+scene.verticalExaggeration = EXAGERATION_DEFAUT;
+scene.verticalExaggerationRelativeHeight = ONDULATION_GEOIDE;
+
+// Vue générale inclinée de NCPA, regard vers le nord (la mer en arrière-plan).
+function vueNCPA(duree = 0) {
+  const e = EMPRISE_NCPA;
+  const centre = Cesium.Cartesian3.fromDegrees((e.ouest + e.est) / 2, (e.sud + e.nord) / 2, ONDULATION_GEOIDE);
+  viewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(centre, 1), {
+    offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-38), 30000),
+    duration: duree,
+  });
+}
+vueNCPA();
+</script>
+</body>
+</html>

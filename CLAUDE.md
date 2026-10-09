@@ -148,6 +148,19 @@ Script : `scripts/etape1_communes.py` (prérequis : `pip install -r scripts/requ
 - `data/epci.geojson` : 51 Ko, un seul polygone sans trou, 279,2 km², **identique** au contour EPCI officiel de l'API (écart 0 m²).
 - Emprise de NCPA : longitude −0,2958 → 0,0664 ; latitude 49,1497 → 49,3214.
 
+## Résultats de l'étape 2 (vérifiés le 09/10/2026)
+
+`index.html` : Cesium 1.145.0 (jsDelivr, avec contrôle d'intégrité SRI) + relief IGN, fond neutre provisoire (teinte selon l'altitude + courbes de niveau tous les 10 m).
+
+- Testé dans Chromium (rendu logiciel SwiftShader, donc lent) : console sans message, aucune requête vers Cesium Ion.
+- `CustomHeightmapTerrainProvider` : la tuile Cesium (x, y, niveau) = la tuile IGN (colonne x, ligne y, même niveau). Grille de 257 × 257 points aux coins des pixels IGN (moyenne des 4 pixels voisins).
+- **Raccord des tuiles** : les 8 tuiles IGN voisines sont aussi téléchargées pour calculer les bords → aucune marche entre tuiles de même niveau. Sans raccord, décrochements d'environ 1 m visibles en vue rapprochée sur les pentes (testé sur les coteaux de Houlgate). Coût : environ 3 à 4 fois plus de requêtes IGN (vue générale : 87 requêtes, 9 Mo). Constante `RACCORD_VOISINES` dans `index.html`. À réévaluer à l'étape 5 si le chargement est lent.
+- Hors des niveaux 6 à 14 : sol plat au niveau de la mer sous le niveau 6 ; au-delà du niveau 14, `getTileDataAvailable` renvoie `false` et Cesium affine à partir du niveau 14.
+- Ondulation du géoïde (grille IGN RAF20, via pyproj) : 45,5 à 46,0 m sur NCPA → constante `ONDULATION_GEOIDE = 45.7`. `scene.verticalExaggerationRelativeHeight` = cette valeur (l'exagération part du niveau de la mer).
+- Le relief Cesium de type « heightmap » n'a pas de normales : pas d'ombrage du relief par l'éclairage. Le relief se lit par la géométrie en vue inclinée.
+- Restent visibles avec la coloration provisoire : fins pointillés le long de certaines limites de tuiles (jupes entre tuiles de niveaux différents). À contrôler avec l'orthophoto à l'étape 3.
+- Mention « © IGN – Géoplateforme » affichée en permanence (crédit du fournisseur de relief).
+
 ## Pistes V2 (ne pas développer sans demande)
 
 - MNT LiDAR HD pour un zoom très détaillé.
