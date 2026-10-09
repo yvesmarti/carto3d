@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Étape 0 — test CORS des flux IGN</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 24px; background: #fff; color: #222; }
+  li { margin: 6px 0; } .ok { color: #1a7f37; } .ko { color: #c62828; } code { font-size: 13px; }
+</style>
+</head>
+<body>
+<!--
+  À ouvrir via un serveur local (et non par double-clic) :
+    python -m http.server 8000      (lancé à la racine du projet)
+    puis http://localhost:8000/scripts/etape0_test_cors.html
+  La page demande au navigateur de lire une tuile de relief et une tuile d'orthophoto.
+  Si le serveur IGN n'autorise pas les pages d'une autre origine (CORS), le navigateur refuse la lecture.
+-->
+<h1>Test CORS des flux IGN</h1>
+<ul id="resultats"></ul>
+<script>
+  // Tuiles au-dessus de Cabourg (mêmes paramètres que scripts/etape0_verifier_flux_ign.py).
+  const tests = [
+    { nom: "Relief (BIL float32, WGS84G niveau 11)",
+      url: "https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES&STYLE=normal&TILEMATRIXSET=WGS84G&TILEMATRIX=11&TILEROW=463&TILECOL=2046&FORMAT=image/x-bil;bits=32" },
+    { nom: "Orthophoto (JPEG, PM niveau 15)", image: true,
+      url: "https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&TILEMATRIXSET=PM&TILEMATRIX=15&TILEROW=11213&TILECOL=16373&FORMAT=image/jpeg" },
+  ];
+  const liste = document.getElementById("resultats");
+  const ecrire = (ok, texte) => {
+    const li = document.createElement("li");
+    li.className = ok ? "ok" : "ko";
+    li.textContent = (ok ? "✔ " : "✘ ") + texte;
+    liste.appendChild(li);
+    console.log(texte);
+  };
+
+  for (const t of tests) {
+    // 1) lecture des octets (c'est ce que fera Cesium pour le relief)
+    fetch(t.url, { mode: "cors" })
+      .then(r => r.arrayBuffer().then(b => ecrire(r.ok, `${t.nom} — fetch : HTTP ${r.status}, ${b.byteLength} octets, Content-Type ${r.headers.get("Content-Type")}`)))
+      .catch(err => ecrire(false, `${t.nom} — fetch bloqué : ${err}`));
+    // 2) image utilisable comme texture WebGL (c'est ce que fera Cesium pour l'orthophoto)
+    if (t.image) {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        try {
+          const c = document.createElement("canvas");
+          c.width = img.width; c.height = img.height;
+          const ctx = c.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          ctx.getImageData(0, 0, 1, 1); // échoue si l'image n'est pas autorisée en CORS
+          ecrire(true, `${t.nom} — image ${img.width}×${img.height} lisible par le canvas (texture WebGL possible)`);
+        } catch (err) { ecrire(false, `${t.nom} — image chargée mais non lisible (CORS) : ${err}`); }
+      };
+      img.onerror = () => ecrire(false, `${t.nom} — image refusée (CORS ou erreur réseau)`);
+      img.src = t.url;
+    }
+  }
+</script>
+</body>
+</html>
